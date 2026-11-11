@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include "svcstate.h"
 
 #define APP_NAME          L"PowerTool"
 #define MAX_ITEMS         64
@@ -229,25 +230,36 @@ static void service_exe_path(const wchar_t *image, wchar_t *out)
 }
 
 /*
- * Services PowerTool disabled are remembered in settings.ini ([DisabledServices],
- * name=<original start type>,<delayed-auto flag>) so they can be re-enabled later.
+ * The state a service had BEFORE governance first touched it is remembered in settings.ini
+ * ([DisabledServices], name=<startType>,<delayedAuto>,<wasRunning>; see svcstate.h) so it can
+ * be put back on disable. A record is written once and never overwritten while it exists, so
+ * repeated enable/disable cannot replace the original state with the governed one.
  */
 #define DISABLED_SECTION L"DisabledServices"
 
-static void service_record(SC_HANDLE s, const wchar_t *name, DWORD startType)
+static wchar_t g_restoreNote[160];      /* last restore problem, shown in the status line */
+
+/* Save the original state unless a record already exists. Returns TRUE if a record exists. */
+static BOOL service_record(SC_HANDLE s, const wchar_t *name, DWORD startType, BOOL running)
 {
     SERVICE_DELAYED_AUTO_START_INFO d = {0};
     DWORD n = 0;
-    wchar_t val[32];
+    wchar_t old[32], val[32];
+    SvcState st;
 
+    GetPrivateProfileStringW(DISABLED_SECTION, name, L"", old, 32, g_ini);
+    if (old[0] && svcstate_parse(old, &st)) return TRUE;    /* keep the original */
     QueryServiceConfig2W(s, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, (LPBYTE)&d, sizeof d, &n);
-    swprintf(val, 32, L"%lu,%d", startType, d.fDelayedAutostart ? 1 : 0);
-    WritePrivateProfileStringW(DISABLED_SECTION, name, val, g_ini);
+    st.type = startType; st.delayed = d.fDelayedAutostart ? 1 : 0; st.running = running ? 1 : 0;
+    svcstate_format(val, 32, &st);
+    return WritePrivateProfileStringW(DISABLED_SECTION, name, val, g_ini) != 0;
 }
 
 /*
- * Put back the start type of services PowerTool disabled. With all=FALSE only those whose
- * executable is no longer blacklisted are restored. The service is not started.
+ * Put back the state of services PowerTool governed: start type (incl. delayed-auto) and, if
+ * the service was running before, start it again. A service that was stopped stays stopped.
+ * With all=FALSE only those whose executable is no longer blacklisted are restored.
+ * Missing service or corrupt record: record dropped, nothing changed, noted in g_restoreNote.
  */
 static void services_restore(BOOL all)
 {
@@ -263,41 +275,60 @@ static void services_restore(BOOL all)
     }
     for (const wchar_t *nm = names; *nm; nm += wcslen(nm) + 1) {
         wchar_t val[32];
-        unsigned long type = 0;
-        int delayed = 0;
-        SC_HANDLE s = OpenServiceW(scm, nm, SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG);
+        SvcState st;
+        SC_HANDLE s = OpenServiceW(scm, nm, SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG |
+                                            SERVICE_QUERY_STATUS | SERVICE_START);
         DWORD sz = 0;
         QUERY_SERVICE_CONFIGW *cfg = NULL;
+        SERVICE_STATUS ss;
+        SvcPlan plan;
+        BOOL ok = TRUE;
 
         if (!s) {
-            if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST)
+            if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
                 WritePrivateProfileStringW(DISABLED_SECTION, nm, NULL, g_ini);
+                swprintf(g_restoreNote, 160, L"%ls: service missing, record dropped", nm);
+            }
             continue;
         }
+        QueryServiceConfigW(s, NULL, 0, &sz);
+        cfg = sz ? malloc(sz) : NULL;
+        if (!cfg || !QueryServiceConfigW(s, cfg, sz, &sz)) { free(cfg); CloseServiceHandle(s); continue; }
         if (!all) {
             wchar_t path[MAX_PATH];
-            QueryServiceConfigW(s, NULL, 0, &sz);
-            cfg = sz ? malloc(sz) : NULL;
-            if (!cfg || !QueryServiceConfigW(s, cfg, sz, &sz)) { free(cfg); CloseServiceHandle(s); continue; }
             service_exe_path(cfg->lpBinaryPathName, path);
-            free(cfg);
-            if (is_blacklisted(path)) { CloseServiceHandle(s); continue; }
+            if (is_blacklisted(path)) { free(cfg); CloseServiceHandle(s); continue; }
         }
         GetPrivateProfileStringW(DISABLED_SECTION, nm, L"", val, 32, g_ini);
-        if (swscanf(val, L"%lu,%d", &type, &delayed) >= 1 && type != SERVICE_DISABLED &&
-            ChangeServiceConfigW(s, SERVICE_NO_CHANGE, (DWORD)type, SERVICE_NO_CHANGE,
-                                 NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
-            if (delayed && type == SERVICE_AUTO_START) {
-                SERVICE_DELAYED_AUTO_START_INFO d = { TRUE };
-                ChangeServiceConfig2W(s, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &d);
-            }
+        if (!svcstate_parse(val, &st)) {
+            /* corrupt record: safe fallback = leave the service as it is */
+            WritePrivateProfileStringW(DISABLED_SECTION, nm, NULL, g_ini);
+            swprintf(g_restoreNote, 160, L"%ls: saved state unreadable, left unchanged", nm);
+            free(cfg); CloseServiceHandle(s);
+            continue;
+        }
+        plan = svcstate_plan(&st, cfg->dwStartType,
+                             QueryServiceStatus(s, &ss) && ss.dwCurrentState != SERVICE_STOPPED);
+        if (plan.set_type)
+            ok = ChangeServiceConfigW(s, SERVICE_NO_CHANGE, (DWORD)st.type, SERVICE_NO_CHANGE,
+                                      NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        if (ok && plan.set_delayed) {
+            SERVICE_DELAYED_AUTO_START_INFO d = { TRUE };
+            ChangeServiceConfig2W(s, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &d);
+        }
+        if (ok) {
+            if (plan.start && !StartServiceW(s, 0, NULL))
+                swprintf(g_restoreNote, 160, L"%ls: restored but could not start (error %lu)",
+                         nm, GetLastError());
             WritePrivateProfileStringW(DISABLED_SECTION, nm, NULL, g_ini);
         }
+        free(cfg);
         CloseServiceHandle(s);
     }
     CloseServiceHandle(scm);
     free(names);
 }
+
 
 /* Disable and stop services whose executable is blacklisted. Needs admin rights to succeed. */
 static unsigned stop_blacklisted_services(void)
@@ -327,12 +358,17 @@ static unsigned stop_blacklisted_services(void)
                 service_exe_path(cfg->lpBinaryPathName, path);
                 if (is_blacklisted(path)) {
                     /* disable first so it cannot restart (recovery action or next boot) */
-                    if (cfg->dwStartType != SERVICE_DISABLED) {
-                        service_record(s, svc[i].lpServiceName, cfg->dwStartType);
-                        if (!ChangeServiceConfigW(s, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
-                                                  NULL, NULL, NULL, NULL, NULL, NULL, NULL))
-                            WritePrivateProfileStringW(DISABLED_SECTION, svc[i].lpServiceName, NULL, g_ini);
-                    }
+                    wchar_t had[32];
+                    BOOL fresh;
+                    GetPrivateProfileStringW(DISABLED_SECTION, svc[i].lpServiceName, L"", had, 32, g_ini);
+                    fresh = !had[0];
+                    /* remember the pre-governance state once (never overwritten), then disable */
+                    service_record(s, svc[i].lpServiceName, cfg->dwStartType,
+                                   svc[i].ServiceStatusProcess.dwCurrentState != SERVICE_STOPPED);
+                    if (cfg->dwStartType != SERVICE_DISABLED &&
+                        !ChangeServiceConfigW(s, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
+                                              NULL, NULL, NULL, NULL, NULL, NULL, NULL) && fresh)
+                        WritePrivateProfileStringW(DISABLED_SECTION, svc[i].lpServiceName, NULL, g_ini);
                     if (svc[i].ServiceStatusProcess.dwCurrentState != SERVICE_STOPPED &&
                         ControlService(s, SERVICE_CONTROL_STOP, &ss))
                         stopped++;
@@ -390,7 +426,11 @@ static void timer_apply(void)
         scan_and_kill();
     } else {
         services_restore(TRUE);                 /* ending is off: re-enable what we disabled */
-        set_status(g_enabled ? L"Enabled, but the blacklist is empty" : L"Disabled");
+        if (g_restoreNote[0]) {
+            set_status(g_restoreNote);          /* report restore problems clearly */
+            g_restoreNote[0] = 0;
+        } else
+            set_status(g_enabled ? L"Enabled, but the blacklist is empty" : L"Disabled");
     }
 }
 

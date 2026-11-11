@@ -13,6 +13,16 @@
 
 #define SVC_T_DISABLED 4UL
 #define SVC_T_AUTO     2UL
+#define SVC_T_MANUAL   3UL
+
+/* SCM dwCurrentState codes (same values as winsvc.h, kept here so this header stays Win32-free) */
+#define SVC_S_STOPPED          1UL
+#define SVC_S_START_PENDING    2UL
+#define SVC_S_STOP_PENDING     3UL
+#define SVC_S_RUNNING          4UL
+#define SVC_S_CONTINUE_PENDING 5UL
+#define SVC_S_PAUSE_PENDING    6UL
+#define SVC_S_PAUSED           7UL
 
 typedef struct { unsigned long type; int delayed; int running; /* -1 unknown */ } SvcState;
 typedef struct { int set_type; int set_delayed; int start; } SvcPlan;
@@ -42,5 +52,28 @@ static SvcPlan svcstate_plan(const SvcState *orig, unsigned long curType, int cu
     /* start only if it was running before, is stopped now, and is not meant to stay disabled */
     p.start = orig->running == 1 && !curRunning && orig->type != SVC_T_DISABLED;
     return p;
+}
+
+/*
+ * Is the service "running" for restore purposes? RUNNING, START_PENDING (it is coming up; a
+ * StartService on it only returns ERROR_SERVICE_ALREADY_RUNNING), CONTINUE_PENDING,
+ * PAUSE_PENDING and PAUSED count as running. STOPPED and STOP_PENDING (going down) do not.
+ * Unknown codes count as not running.
+ */
+static int svcstate_is_running(unsigned long state)
+{
+    return state == SVC_S_RUNNING || state == SVC_S_START_PENDING ||
+           state == SVC_S_CONTINUE_PENDING || state == SVC_S_PAUSE_PENDING ||
+           state == SVC_S_PAUSED;
+}
+
+/*
+ * Start type to use when the saved record is unreadable. A service left Disabled would lock the
+ * user out, so Disabled becomes Manual (restorable, not auto-started, not started now).
+ * Any other start type is returned unchanged.
+ */
+static unsigned long svcstate_fallback_type(unsigned long curType)
+{
+    return curType == SVC_T_DISABLED ? SVC_T_MANUAL : curType;
 }
 #endif

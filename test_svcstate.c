@@ -39,6 +39,23 @@ int main(void)
     CHECK(!svcstate_parse(L"2,0,7", &s));
     CHECK(!svcstate_parse(NULL, &s));
 
+    /* svcstate_is_running: every SCM code 0..8 (BVA on both sides of the valid range) */
+    {
+        static const int exp[9] = {0, 0, 1, 0, 1, 1, 1, 1, 0}; /* 0 unknown,1 STOPPED,2 START_PEND,
+            3 STOP_PEND,4 RUNNING,5 CONT_PEND,6 PAUSE_PEND,7 PAUSED,8 unknown */
+        unsigned long c;
+        for (c = 0; c <= 8; c++) CHECK(svcstate_is_running(c) == exp[c]);
+        CHECK(svcstate_is_running(0xFFFFFFFFUL) == 0);
+    }
+
+    /* svcstate_fallback_type: Disabled -> Manual, all others unchanged */
+    {
+        unsigned long t;
+        CHECK(svcstate_fallback_type(4) == 3);
+        for (t = 0; t <= 3; t++) CHECK(svcstate_fallback_type(t) == t);
+        CHECK(svcstate_fallback_type(5) == 5);
+    }
+
     printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
     return fails != 0;
 }

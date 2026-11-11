@@ -37,6 +37,9 @@ int main(void)
     CHECK(!svcstate_parse(L"9,0,1", &s));
     CHECK(!svcstate_parse(L"2,5,1", &s));
     CHECK(!svcstate_parse(L"2,0,7", &s));
+    CHECK(!svcstate_parse(L"2,0,2", &s));   /* BVA: just above max */
+    CHECK(!svcstate_parse(L"2,0,-1", &s));  /* BVA: just below min */
+    CHECK(!svcstate_parse(L"2,-1,1", &s));  /* delayed just below min */
     CHECK(!svcstate_parse(NULL, &s));
 
     /* svcstate_is_running: every SCM code 0..8 (BVA on both sides of the valid range) */

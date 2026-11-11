@@ -259,7 +259,8 @@ static BOOL service_record(SC_HANDLE s, const wchar_t *name, DWORD startType, BO
  * Put back the state of services PowerTool governed: start type (incl. delayed-auto) and, if
  * the service was running before, start it again. A service that was stopped stays stopped.
  * With all=FALSE only those whose executable is no longer blacklisted are restored.
- * Missing service or corrupt record: record dropped, nothing changed, noted in g_restoreNote.
+ * Missing service or corrupt record: record dropped (a corrupt record on a Disabled service sets
+ * it to Manual), noted in g_restoreNote, which scan_and_kill() / timer_apply() display.
  */
 static void services_restore(BOOL all)
 {
@@ -301,14 +302,23 @@ static void services_restore(BOOL all)
         }
         GetPrivateProfileStringW(DISABLED_SECTION, nm, L"", val, 32, g_ini);
         if (!svcstate_parse(val, &st)) {
-            /* corrupt record: safe fallback = leave the service as it is */
+            /* corrupt record: drop it; a Disabled service becomes Manual so it is not locked out */
+            unsigned long ft = svcstate_fallback_type(cfg->dwStartType);
             WritePrivateProfileStringW(DISABLED_SECTION, nm, NULL, g_ini);
-            swprintf(g_restoreNote, 160, L"%ls: saved state unreadable, left unchanged", nm);
+            if (ft != cfg->dwStartType &&
+                ChangeServiceConfigW(s, SERVICE_NO_CHANGE, (DWORD)ft, SERVICE_NO_CHANGE,
+                                     NULL, NULL, NULL, NULL, NULL, NULL, NULL))
+                swprintf(g_restoreNote, 160, L"%ls: saved state unreadable, set to Manual", nm);
+            else if (ft != cfg->dwStartType)
+                swprintf(g_restoreNote, 160, L"%ls: saved state unreadable, could not set Manual (error %lu)",
+                         nm, GetLastError());
+            else
+                swprintf(g_restoreNote, 160, L"%ls: saved state unreadable, left unchanged", nm);
             free(cfg); CloseServiceHandle(s);
             continue;
         }
         plan = svcstate_plan(&st, cfg->dwStartType,
-                             QueryServiceStatus(s, &ss) && ss.dwCurrentState != SERVICE_STOPPED);
+                             QueryServiceStatus(s, &ss) && svcstate_is_running(ss.dwCurrentState));
         if (plan.set_type)
             ok = ChangeServiceConfigW(s, SERVICE_NO_CHANGE, (DWORD)st.type, SERVICE_NO_CHANGE,
                                       NULL, NULL, NULL, NULL, NULL, NULL, NULL);
@@ -364,7 +374,7 @@ static unsigned stop_blacklisted_services(void)
                     fresh = !had[0];
                     /* remember the pre-governance state once (never overwritten), then disable */
                     service_record(s, svc[i].lpServiceName, cfg->dwStartType,
-                                   svc[i].ServiceStatusProcess.dwCurrentState != SERVICE_STOPPED);
+                                   svcstate_is_running(svc[i].ServiceStatusProcess.dwCurrentState));
                     if (cfg->dwStartType != SERVICE_DISABLED &&
                         !ChangeServiceConfigW(s, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
                                               NULL, NULL, NULL, NULL, NULL, NULL, NULL) && fresh)
@@ -390,7 +400,7 @@ static void scan_and_kill(void)
     DWORD self = GetCurrentProcessId();
     unsigned killed = stop_blacklisted_services();
     SYSTEMTIME st;
-    wchar_t t[128];
+    wchar_t t[320];
 
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
@@ -411,8 +421,13 @@ static void scan_and_kill(void)
 
     g_killed += killed;
     GetLocalTime(&st);
-    swprintf(t, 128, L"Last scan %02d:%02d:%02d - killed %u total",
+    swprintf(t, 320, L"Last scan %02d:%02d:%02d - killed %u total",
              st.wHour, st.wMinute, st.wSecond, g_killed);
+    if (g_restoreNote[0]) {                     /* show a restore problem in the same tick */
+        size_t l = wcslen(t);
+        swprintf(t + l, 320 - l, L" | %ls", g_restoreNote);
+        g_restoreNote[0] = 0;
+    }
     set_status(t);
 }
 

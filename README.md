@@ -10,7 +10,21 @@ Requires MinGW-w64 GCC. Run `build.bat`.
 
 Run `powertool.exe` (starts in the tray; double-click the icon for Settings).
 Settings: Start with Windows, Enable, check interval in seconds, and the blacklist of full exe paths (matched case-insensitively against each running process's image path).
-Stored in `%APPDATA%\PowerTool\settings.ini`. The Keep awake tab has an optional "Force sleep when the laptop lid is closed" checkbox: PowerTool watches the lid switch and puts the PC to sleep when it closes (it must be running at that time). Windows services whose executable is on the blacklist are also stopped and set to Disabled (PowerTool saves each service's state from before it was first governed - start type incl. delayed-auto, and running/stopped - in the `[DisabledServices]` section of settings.ini, never overwriting it on re-enable. When you turn off "Enable ending blacklisted processes" or remove the entry it restores the start type and starts the service again only if it was running before; a service that was stopped stays stopped. Killed processes are not relaunched. A service that is stopping (STOP_PENDING) counts as stopped; one that is starting counts as running. A missing service is dropped from the records and the status line says so. An unreadable record is dropped too; if that service is still Disabled it is set to Manual (not started) so it is not locked out, otherwise it is left as-is. Restore problems appear in the status line on the same scan) (PowerTool's manifest requires administrator rights, so it prompts for UAC elevation on launch). Only processes the current user can terminate are affected; PowerTool itself and System32 files cannot be blacklisted.
+Stored in `%APPDATA%\PowerTool\settings.ini`. The Keep awake tab has an optional "Force sleep when the laptop lid is closed" checkbox: PowerTool watches the lid switch and puts the PC to sleep when it closes (it must be running at that time). Windows services whose executable is on the blacklist are also stopped and set to Disabled (PowerTool saves each service's state from before it was first governed - start type incl. delayed-auto, and running/stopped - in the `[DisabledServices]` section of settings.ini, never overwriting it on re-enable. When you turn off "Enable ending blacklisted processes" or remove the entry it restores the start type and starts the service again only if it was running before; a service that was stopped stays stopped. Killed processes are not relaunched. A service that is stopping (STOP_PENDING) counts as stopped; one that is starting counts as running. A missing service is dropped from the records and the status line says so. An unreadable record is dropped too; if that service is still Disabled it is set to Manual (not started) so it is not locked out, otherwise it is left as-is. Restore problems appear in the status line on the same scan). Only processes the current user can terminate are affected; PowerTool itself and System32 files cannot be blacklisted.
+
+### Command-Line Interface (CLI)
+
+`powertool.exe` can be invoked from any standard (non-elevated) command prompt or script to control App Govern without GUI interaction or process restarts:
+
+```cmd
+powertool.exe --govern on     # Turn App Govern ON (kills blacklisted procs and stops services)
+powertool.exe --govern off    # Turn App Govern OFF (restores services and allows execution)
+powertool.exe --status        # Show running status and App Govern state
+powertool.exe --help          # Show CLI options
+```
+
+- **Non-Elevated Callers**: When PowerTool is already running in the background as an elevated tray app, CLI invocations forward the command across the Windows UIPI barrier via `WM_COPYDATA` (permitted by `ChangeWindowMessageFilterEx`).
+- **Live In-Process Execution**: The running elevated process applies the toggle immediately without terminating, restarting, or popping up any windows. If PowerTool is not running, the CLI updates `settings.ini` directly so the setting takes effect on next launch.
 
 ## Keep awake tab
 

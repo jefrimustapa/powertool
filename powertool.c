@@ -19,6 +19,7 @@
 #include <powrprof.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <wchar.h>
 #include "svcstate.h"
 
@@ -942,6 +943,30 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_TRAY_EXIT:      DestroyWindow(hwnd); break;
         }
         return 0;
+    case WM_COPYDATA: {
+        COPYDATASTRUCT *cds = (COPYDATASTRUCT *)lp;
+        if (cds && cds->lpData) {
+            const char *msg = (const char *)cds->lpData;
+            if (strcmp(msg, "govern:on") == 0) {
+                g_enabled = TRUE;
+                SendMessageW(g_chkEnable, BM_SETCHECK, BST_CHECKED, 0);
+                config_save();
+                timer_apply();
+                tray_tip();
+                return 1;
+            } else if (strcmp(msg, "govern:off") == 0) {
+                g_enabled = FALSE;
+                SendMessageW(g_chkEnable, BM_SETCHECK, BST_UNCHECKED, 0);
+                config_save();
+                timer_apply();
+                tray_tip();
+                return 1;
+            } else if (strcmp(msg, "status") == 0) {
+                return g_enabled ? 2 : 1;
+            }
+        }
+        return 0;
+    }
     case WM_TRAY:
         if (lp == WM_LBUTTONDBLCLK) {
             show_settings();
@@ -971,9 +996,155 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+static void print_console(const wchar_t *fmt, ...)
+{
+    wchar_t buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vswprintf(buf, 1024, fmt, ap);
+    va_end(ap);
+    if (len <= 0) return;
+
+    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hStdOut && hStdOut != INVALID_HANDLE_VALUE) {
+        DWORD mode;
+        if (GetConsoleMode(hStdOut, &mode)) {
+            DWORD written;
+            WriteConsoleW(hStdOut, buf, (DWORD)len, &written, NULL);
+            return;
+        } else {
+            char utf8[4096];
+            int ulen = WideCharToMultiByte(CP_UTF8, 0, buf, len, utf8, sizeof(utf8), NULL, NULL);
+            if (ulen > 0) {
+                DWORD written;
+                WriteFile(hStdOut, utf8, (DWORD)ulen, &written, NULL);
+                return;
+            }
+        }
+    }
+
+    /* Fallback: if stdout is not piped/redirected, write directly to CONOUT$ */
+    HANDLE hConOut = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hConOut && hConOut != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteConsoleW(hConOut, buf, (DWORD)len, &written, NULL);
+        CloseHandle(hConOut);
+    }
+}
+
+static HWND find_powertool_window(void)
+{
+    HWND h = FindWindowW(APP_NAME L"Window", NULL);
+    if (!h) {
+        HWINSTA hw = OpenWindowStationW(L"WinSta0", FALSE, GENERIC_ALL);
+        if (hw) {
+            SetProcessWindowStation(hw);
+            HDESK hd = OpenDesktopW(L"Default", 0, FALSE, GENERIC_ALL);
+            if (hd) {
+                SetThreadDesktop(hd);
+                h = FindWindowW(APP_NAME L"Window", NULL);
+                CloseDesktop(hd);
+            }
+            CloseWindowStation(hw);
+        }
+    }
+    return h;
+}
+
+static int cli_run(int argc, PWSTR *argv)
+{
+    if (argc <= 1) return -1; /* Not a CLI invocation */
+
+    AttachConsole(ATTACH_PARENT_PROCESS);
+
+    if (_wcsicmp(argv[1], L"--help") == 0 || _wcsicmp(argv[1], L"-h") == 0 || wcscmp(argv[1], L"/?") == 0) {
+        print_console(L"PowerTool CLI\n"
+                      L"Usage:\n"
+                      L"  powertool.exe --govern on|off    Enable or disable App Govern (live in-process)\n"
+                      L"  powertool.exe --status           Check current App Govern and running status\n"
+                      L"  powertool.exe --help, -h         Show this help text\n");
+        return 0;
+    }
+
+    if (_wcsicmp(argv[1], L"--status") == 0 || _wcsicmp(argv[1], L"-s") == 0) {
+        HWND hRunning = find_powertool_window();
+        config_init_path();
+        config_load();
+        if (hRunning) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hRunning, &pid);
+            COPYDATASTRUCT cds = {0};
+            cds.dwData = 1;
+            cds.cbData = 7;
+            cds.lpData = (void *)"status";
+            DWORD_PTR res = 0;
+            BOOL liveGov = g_enabled;
+            if (SendMessageTimeoutW(hRunning, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 2000, &res)) {
+                if (res == 2) liveGov = TRUE;
+                else if (res == 1) liveGov = FALSE;
+            }
+            print_console(L"PowerTool: Running (PID %lu) | App Govern: %ls | Interval: %d s\n",
+                          pid, liveGov ? L"ON" : L"OFF", g_interval);
+        } else {
+            print_console(L"PowerTool: Not running | App Govern (saved): %ls | Interval: %d s\n",
+                          g_enabled ? L"ON" : L"OFF", g_interval);
+        }
+        return 0;
+    }
+
+    if (_wcsicmp(argv[1], L"--govern") == 0 || _wcsicmp(argv[1], L"-g") == 0) {
+        if (argc < 3) {
+            print_console(L"Error: --govern requires 'on' or 'off'. See --help.\n");
+            return 1;
+        }
+        BOOL on = FALSE;
+        if (_wcsicmp(argv[2], L"on") == 0 || wcscmp(argv[2], L"1") == 0) {
+            on = TRUE;
+        } else if (_wcsicmp(argv[2], L"off") == 0 || wcscmp(argv[2], L"0") == 0) {
+            on = FALSE;
+        } else {
+            print_console(L"Error: invalid argument '%ls' for --govern. Expected 'on' or 'off'.\n", argv[2]);
+            return 1;
+        }
+
+        HWND hRunning = find_powertool_window();
+        if (hRunning) {
+            const char *msg = on ? "govern:on" : "govern:off";
+            COPYDATASTRUCT cds = {0};
+            cds.dwData = 1;
+            cds.cbData = (DWORD)(strlen(msg) + 1);
+            cds.lpData = (void *)msg;
+            DWORD_PTR res = 0;
+            if (SendMessageTimeoutW(hRunning, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 5000, &res) && res == 1) {
+                print_console(L"PowerTool: App Govern turned %ls (applied live in-process)\n", on ? L"ON" : L"OFF");
+                return 0;
+            } else {
+                print_console(L"Error: failed to send command to running PowerTool instance (error %lu)\n", GetLastError());
+                return 1;
+            }
+        } else {
+            config_init_path();
+            WritePrivateProfileStringW(L"Settings", L"Enabled", on ? L"1" : L"0", g_ini);
+            print_console(L"PowerTool: not running. Saved App Govern = %ls in settings.ini\n", on ? L"ON" : L"OFF");
+            return 0;
+        }
+    }
+
+    print_console(L"PowerTool: unrecognized option '%ls'. Run with --help for usage.\n", argv[1]);
+    return 1;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
 {
     (void)hPrev; (void)nShow; (void)cmdLine;
+
+    int argc = 0;
+    PWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        int cliExit = cli_run(argc, argv);
+        LocalFree(argv);
+        if (cliExit >= 0) return cliExit;
+    }
 
     dpi_enable();       /* must happen before any window is created */
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
@@ -1017,6 +1188,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmdLine, int nShow)
     if (!hwnd) return 1;
     /* we run elevated; let Explorer's (non-elevated) TaskbarCreated broadcast through UIPI */
     ChangeWindowMessageFilterEx(hwnd, g_msgTaskbarCreated, MSGFLT_ALLOW, NULL);
+    /* let non-elevated CLI processes send WM_COPYDATA through UIPI */
+    ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
 
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL,
                  (LPARAM)app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)));
